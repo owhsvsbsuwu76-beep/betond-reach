@@ -1,7 +1,17 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from "react";
-import { onAuthStateChanged, signInWithPopup, signInWithRedirect, signOut } from "firebase/auth";
+import { getRedirectResult, onAuthStateChanged, signInWithPopup, signInWithRedirect, signOut } from "firebase/auth";
 import { User, UserData, emptyData, uid } from "./data";
-import { AUTH_READY, FIREBASE_CONFIGURED, auth, authErrorCode, friendlyFirebaseError, googleProvider, isLikelyMobile } from "./firebase";
+import {
+  AUTH_READY,
+  FIREBASE_CONFIGURED,
+  auth,
+  authErrorCode,
+  authResolver,
+  friendlyFirebaseError,
+  googleProvider,
+  isInternalAuthError,
+  isLikelyMobile,
+} from "./firebase";
 
 /* ------------------------------------------------------------------ */
 /*  Frontend-only store backed by Firebase Authentication.             */
@@ -75,6 +85,13 @@ function toAppUser(fb: FirebaseUserLike): User {
 
 const PENDING_REDIRECT_KEY = "br:pendingGoogle";
 
+function goAfterLogin(target: string) {
+  const dest = target.startsWith("/") ? target : "/dashboard";
+  const current = (typeof window !== "undefined" ? window.location.hash.replace(/^#/, "") : "") || "/";
+  if (current === dest) return;
+  window.location.hash = dest;
+}
+
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [ready, setReady] = useState(false);
@@ -94,17 +111,22 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       setReady(true);
       return;
     }
+    // Completes the mobile/redirect flow after Google sends the user back.
+    getRedirectResult(auth).catch((e) => {
+      console.warn("[BR-AUTH] Redirect result:", e);
+    });
     const unsub = onAuthStateChanged(auth, (fbUser) => {
       if (fbUser) {
         const u = toAppUser(fbUser);
         setUser(u);
-        // Completion of the mobile redirect flow: surface account feedback once.
-        if (sessionStorage.getItem(PENDING_REDIRECT_KEY)) {
+        const pending = sessionStorage.getItem(PENDING_REDIRECT_KEY);
+        if (pending) {
           sessionStorage.removeItem(PENDING_REDIRECT_KEY);
           toast(
             u.isFirstLogin ? "Account created" : "Welcome back",
             u.isFirstLogin ? `Your Beyond Reach account was created with ${u.email}.` : `Signed in as ${u.name}.`
           );
+          goAfterLogin(pending === "1" ? "/dashboard" : pending);
         }
       } else {
         sessionStorage.removeItem(PENDING_REDIRECT_KEY);
@@ -128,10 +150,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const target = next || "/dashboard";
       // Full-page redirect flow (mobile-first). Also used as the automatic
       // desktop fallback when a popup is blocked or unsupported.
+      // Third argument MUST be browserPopupRedirectResolver — passing a URL
+      // object causes "INTERNAL ASSERTION FAILED: Expected a class definition".
       const doRedirect = async () => {
-        const url = `${window.location.origin}${window.location.pathname}#${target}`;
-        sessionStorage.setItem(PENDING_REDIRECT_KEY, "1");
-        await signInWithRedirect(fbAuth, googleProvider(), { url });
+        sessionStorage.setItem(PENDING_REDIRECT_KEY, target);
+        await signInWithRedirect(fbAuth, googleProvider(), authResolver);
       };
       try {
         if (isLikelyMobile()) {
@@ -143,7 +166,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         // Firebase automatically creates the account record on first sign-in
         // and returns the same record on every later sign-in (no duplicates).
         try {
-          const cred = await signInWithPopup(fbAuth, googleProvider());
+          const cred = await signInWithPopup(fbAuth, googleProvider(), authResolver);
           if (cred.user) {
             const u = toAppUser(cred.user);
             toast(
@@ -153,11 +176,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           }
           return { ok: true };
         } catch (popupErr) {
-          const code = (popupErr as { code?: string })?.code ?? "";
-          if (code === "auth/popup-blocked" || code === "auth/operation-not-supported-in-this-environment") {
-            // Some browsers/environments (kiosks, in-app browsers, strict
-            // settings) cannot host the popup — fall back to the redirect
-            // flow automatically instead of surfacing an error.
+          const code = authErrorCode(popupErr) ?? "";
+          if (
+            code === "auth/popup-blocked" ||
+            code === "auth/operation-not-supported-in-this-environment" ||
+            isInternalAuthError(popupErr)
+          ) {
+            // Popup unavailable (blocked, iframe, missing resolver) — fall
+            // back to the redirect flow instead of showing a dead-end error.
             console.warn("[BR-AUTH] Popup unavailable in this environment — using redirect flow.", popupErr);
             await doRedirect();
             return { ok: true };
@@ -165,6 +191,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           throw popupErr;
         }
       } catch (e) {
+        sessionStorage.removeItem(PENDING_REDIRECT_KEY);
         return { ok: false, error: friendlyFirebaseError(e), code: authErrorCode(e) };
       }
     },

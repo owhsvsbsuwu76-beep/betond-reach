@@ -7,7 +7,15 @@
 /* ------------------------------------------------------------------ */
 
 import { initializeApp, type FirebaseApp } from "firebase/app";
-import { browserLocalPersistence, GoogleAuthProvider, getAuth, setPersistence, type Auth } from "firebase/auth";
+import {
+  GoogleAuthProvider,
+  browserPopupRedirectResolver,
+  getAuth,
+  indexedDBLocalPersistence,
+  initializeAuth,
+  type Auth,
+  type PopupRedirectResolver,
+} from "firebase/auth";
 
 const apiKey = (import.meta.env.VITE_FIREBASE_API_KEY as string | undefined)?.trim() || undefined;
 const authDomain = (import.meta.env.VITE_FIREBASE_AUTH_DOMAIN as string | undefined)?.trim() || undefined;
@@ -32,15 +40,18 @@ if (FIREBASE_CONFIGURED) {
       messagingSenderId,
       appId,
     });
-    // Module-level, single initialization — no component can trigger a second
-    // one, so no duplicate-instance or double-init inconsistencies are possible.
-    auth = getAuth(app);
-    // Persist the session in IndexedDB so login survives refreshes and browser
-    // restarts. If this particular browser blocks storage, Firebase falls back
-    // internally; we log rather than crash.
-    setPersistence(auth, browserLocalPersistence).catch((e) => {
-      console.warn("[BR-AUTH] Persistence setup fell back (storage restricted in this browser):", e);
-    });
+    // initializeAuth + browserPopupRedirectResolver is required in Vite/bundled
+    // builds. getAuth() alone often throws "INTERNAL ASSERTION FAILED: Expected
+    // a class definition" on popup/redirect because the resolver is not registered.
+    try {
+      auth = initializeAuth(app, {
+        persistence: indexedDBLocalPersistence,
+        popupRedirectResolver: browserPopupRedirectResolver,
+      });
+    } catch {
+      // HMR / second init — reuse the existing instance.
+      auth = getAuth(app);
+    }
   } catch (e) {
     // An environment that cannot initialize Firebase Auth (very old or
     // heavily restricted browser) should still let the rest of the site work.
@@ -54,6 +65,9 @@ if (FIREBASE_CONFIGURED) {
 export const AUTH_READY = !!auth;
 
 export { auth };
+
+/** Pass this as the 3rd argument to popup/redirect so every device has a resolver. */
+export const authResolver: PopupRedirectResolver = browserPopupRedirectResolver;
 
 export function googleProvider(): GoogleAuthProvider {
   const p = new GoogleAuthProvider();
@@ -72,8 +86,6 @@ export const isLikelyMobile = () =>
   typeof window !== "undefined" &&
   (window.innerWidth < 768 || /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent));
 
-const INTERNAL_PATTERNS = /assert|internal|class definition|invalid argument/i;
-
 export function authErrorCode(e: unknown): string | undefined {
   const code = (e as { code?: string })?.code;
   return typeof code === "string" && code ? code : undefined;
@@ -82,7 +94,11 @@ export function authErrorCode(e: unknown): string | undefined {
 export function isInternalAuthError(e: unknown): boolean {
   const code = authErrorCode(e) ?? "";
   const message = e instanceof Error ? e.message : String(e ?? "");
-  return code === "auth/internal-error" || code === "auth/internal-assert-failure" || INTERNAL_PATTERNS.test(message);
+  return (
+    code === "auth/internal-error" ||
+    code === "auth/internal-assert-failure" ||
+    /INTERNAL ASSERTION FAILED/i.test(message)
+  );
 }
 
 /**
@@ -90,10 +106,6 @@ export function isInternalAuthError(e: unknown): boolean {
  * they are logged to the console for diagnostics with "[BR-AUTH]".
  */
 export function friendlyFirebaseError(e: unknown): string {
-  if (isInternalAuthError(e)) {
-    console.warn("[BR-AUTH] Internal sign-in failure (details in this console log):", e);
-    return "We couldn't complete sign-in in this browser. Please try again — if it keeps happening, refresh the page or use a different browser (Chrome works best).";
-  }
   const code = authErrorCode(e) ?? "";
   const host = typeof window !== "undefined" ? window.location.host : "this domain";
   switch (code) {
@@ -106,7 +118,7 @@ export function friendlyFirebaseError(e: unknown): string {
     case "auth/operation-not-supported-in-this-environment":
       return "This browser doesn't support the sign-in window. Please try again — we'll use the sign-in page instead.";
     case "auth/unauthorized-domain":
-      return `This site's domain (${host}) is not authorized in your Firebase project. Fix: Firebase Console → Project settings → Authorized domains → add "${host}" → then sign in again.`;
+      return `This site's domain (${host}) is not authorized in your Firebase project. Fix: Firebase Console → Authentication → Settings → Authorized domains → add "${host}" → then sign in again.`;
     case "auth/cookies-blocked":
       return "This browser is blocking cookies, so sign-in can't be completed. Please allow cookies for this site and try again.";
     case "auth/web-storage-unsupported":
@@ -124,7 +136,12 @@ export function friendlyFirebaseError(e: unknown): string {
     case "auth/timeout":
       return "Timed out while talking to Google. Please try again.";
     default:
-      console.warn("[BR-AUTH] Sign-in failed:", e);
-      return "Google sign-in failed. Please try again.";
+      break;
   }
+  if (isInternalAuthError(e)) {
+    console.warn("[BR-AUTH] Internal sign-in failure (details in this console log):", e);
+    return "We couldn't complete sign-in in this browser. Please try again — if it keeps happening, refresh the page or use a different browser (Chrome works best).";
+  }
+  console.warn("[BR-AUTH] Sign-in failed:", e);
+  return "Google sign-in failed. Please try again.";
 }
